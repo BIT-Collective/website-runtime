@@ -13,6 +13,9 @@ on:
 jobs:
   runtime:
     uses: ./.github/workflows/build-website.yml
+    permissions:
+      contents: read
+      packages: write
     with:
       context: runtime
       dockerfile: runtime/Dockerfile
