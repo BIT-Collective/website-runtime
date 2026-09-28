@@ -1,0 +1,12 @@
+# Coolify-Ressource "Docker Compose" fuer eine statische Website.
+# In Coolify setzen: Domain am Service "web" (https://…), Env-Variablen unten, Ring-Tag an der Ressource.
+# Deployen = IMAGE_TAG aendern + Deploy (bit-deploy). Rollback = alten IMAGE_TAG setzen.
+services:
+  web:
+    image: ${IMAGE:?IMAGE fehlt, z. B. ghcr.io/bit-collective/web-k0001}:${IMAGE_TAG:?IMAGE_TAG fehlt, z. B. sha-1a2b3c4}
+    environment:
+      - SITE_MODE=${SITE_MODE:-staging}
+      - IMAGE_TAG=${IMAGE_TAG}
+      - BASIC_AUTH_USER=${BASIC_AUTH_USER:-}
+      - BASIC_AUTH_HASH=${BASIC_AUTH_HASH:-}
+    restart: unless-stopped

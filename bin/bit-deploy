@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# bit-deploy — Image-Tag auf Coolify-Ressourcen ausrollen ("Weg B": vom Mac, über Tailscale).
+#
+# Aufruf:
+#   bit-deploy list                                   Ressourcen aus der Inventar-Datei anzeigen
+#   bit-deploy <name> <image-tag>                     eine Ressource (auch fuer Rollback)
+#   bit-deploy --ring <ringN> --product <p> <tag>     alle Ressourcen eines Produkts in einem Ring,
+#                                                     nacheinander, Abbruch beim ersten Fehler
+#   Zusatz: --dry-run  zeigt nur, was passieren wuerde
+#
+# Ablauf je Ressource: IMAGE_TAG per Coolify-API setzen -> Deploy anstossen ->
+# Health-URL pollen, bis {"status":"ok","version":"<image-tag>"} kommt (max. 8 min).
+#
+# Konfiguration (lokal, nicht in Git — enthaelt Token bzw. Kunden-Domains):
+#   ~/.config/bit-deploy/env        COOLIFY_URL=http://<tailscale-ip-des-vps>:8000
+#                                   COOLIFY_TOKEN=<API-Token mit deploy+write>
+#   ~/.config/bit-deploy/resources  eine Zeile je Ressource, durch Leerzeichen getrennt:
+#                                   <name> <applications|services> <uuid> <produkt> <ring> <health-url>
+#                                   z. B.: bit-repairs-staging services abc123 web-bit-repairs ring0 https://test.bit-repairs.de/healthz
+
+set -euo pipefail
+
+CONF_DIR="${BIT_DEPLOY_CONF:-$HOME/.config/bit-deploy}"
+BOLD=$(tput bold 2>/dev/null || true); RESET=$(tput sgr0 2>/dev/null || true)
+GREEN=$(tput setaf 2 2>/dev/null || true); RED=$(tput setaf 1 2>/dev/null || true)
+YELLOW=$(tput setaf 3 2>/dev/null || true)
+
+die() { echo "${RED}Fehler:${RESET} $*" >&2; exit 1; }
+usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "${BASH_SOURCE[0]}"; }
+
+DRY_RUN=0; RING=""; PRODUCT=""; ARGS=()
+while (($#)); do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --dry-run) DRY_RUN=1 ;;
+    --ring) RING="${2:?--ring braucht einen Wert}"; shift ;;
+    --product) PRODUCT="${2:?--product braucht einen Wert}"; shift ;;
+    *) ARGS+=("$1") ;;
+  esac
+  shift
+done
+
+INVENTORY="$CONF_DIR/resources"
+[[ -f "$INVENTORY" ]] || die "$INVENTORY fehlt (Format: siehe bit-deploy --help)"
+
+# Inventar ohne Kommentar-/Leerzeilen
+inventory() { grep -vE '^\s*(#|$)' "$INVENTORY"; }
+
+if [[ "${ARGS[0]:-}" == "list" ]]; then
+  { echo "NAME ART UUID PRODUKT RING HEALTH"; inventory; } | column -t
+  exit 0
+fi
+
+# --- Ziele bestimmen ------------------------------------------------------
+
+TARGETS=()
+if [[ -n "$RING" ]]; then
+  [[ -n "$PRODUCT" ]] || die "--ring braucht --product (ein Ring enthaelt verschiedene Produkte mit verschiedenen Images)"
+  (( ${#ARGS[@]} == 1 )) || die "Aufruf: bit-deploy --ring <ringN> --product <p> <image-tag>"
+  IMAGE_TAG="${ARGS[0]}"
+  while read -r line; do TARGETS+=("$line"); done < <(inventory | awk -v r="$RING" -v p="$PRODUCT" '$5==r && $4==p')
+  (( ${#TARGETS[@]} > 0 )) || die "keine Ressource mit Produkt '$PRODUCT' in '$RING'"
+else
+  (( ${#ARGS[@]} == 2 )) || { usage; exit 1; }
+  IMAGE_TAG="${ARGS[1]}"
+  line=$(inventory | awk -v n="${ARGS[0]}" '$1==n') || true
+  [[ -n "$line" ]] || die "Ressource '${ARGS[0]}' nicht im Inventar ($INVENTORY)"
+  TARGETS+=("$line")
+fi
+
+[[ "$IMAGE_TAG" =~ ^(sha-[0-9a-f]{7,}|v[0-9]+\.[0-9]+\.[0-9]+.*)$ ]] \
+  || die "Image-Tag '$IMAGE_TAG' sieht nicht aus wie sha-<hash> oder vX.Y.Z"
+
+echo "${BOLD}=== bit-deploy ${IMAGE_TAG} → ${#TARGETS[@]} Ressource(n) ===${RESET}"
+printf '   %s\n' "${TARGETS[@]}" | awk '{print "   " $1 " (" $4 ", " $5 ")"}'
+
+if (( DRY_RUN )); then
+  echo "${YELLOW}--dry-run: nichts geaendert.${RESET}"
+  exit 0
+fi
+
+# --- Coolify-Zugang -------------------------------------------------------
+
+[[ -f "$CONF_DIR/env" ]] || die "$CONF_DIR/env fehlt (COOLIFY_URL, COOLIFY_TOKEN)"
+set -a; source "$CONF_DIR/env"; set +a
+[[ -n "${COOLIFY_URL:-}" ]] || die "COOLIFY_URL fehlt in $CONF_DIR/env"
+[[ -n "${COOLIFY_TOKEN:-}" ]] || die "COOLIFY_TOKEN fehlt in $CONF_DIR/env"
+command -v jq >/dev/null || die "jq nicht gefunden (brew install jq)"
+
+api() { curl -fsS -m 20 -H "Authorization: Bearer ${COOLIFY_TOKEN}" -H "Accept: application/json" "$@"; }
+
+curl -fsS -m 5 -o /dev/null "${COOLIFY_URL}/api/health" \
+  || die "Coolify unter ${COOLIFY_URL} nicht erreichbar — Tailscale aktiv?"
+
+# --- je Ressource ausrollen ----------------------------------------------
+
+deploy_one() {
+  local name="$1" kind="$2" uuid="$3" health="$6"
+  echo ""
+  echo "${BOLD}→ ${name}${RESET}"
+
+  local payload
+  payload=$(jq -nc --arg v "$IMAGE_TAG" '{data:[{key:"IMAGE_TAG",value:$v,is_preview:false}]}')
+  api -X PATCH -H "Content-Type: application/json" -d "$payload" \
+    "${COOLIFY_URL}/api/v1/${kind}/${uuid}/envs/bulk" >/dev/null \
+    || { echo "${RED}  IMAGE_TAG setzen fehlgeschlagen (Art '${kind}' richtig?)${RESET}"; return 1; }
+  echo "  IMAGE_TAG=${IMAGE_TAG} gesetzt"
+
+  # Coolify 4.3.x: /deploy ist POST.
+  api -X POST "${COOLIFY_URL}/api/v1/deploy?uuid=${uuid}" >/dev/null \
+    || { echo "${RED}  Deploy-Aufruf fehlgeschlagen${RESET}"; return 1; }
+  echo "  Deploy angestossen, warte auf ${health} …"
+
+  local deadline=$(( $(date +%s) + 480 )) body status version
+  while :; do
+    body=$(curl -fsS -m 10 "$health" 2>/dev/null || true)
+    status=$(jq -r '.status // empty' <<<"$body" 2>/dev/null || true)
+    version=$(jq -r '.version // empty' <<<"$body" 2>/dev/null || true)
+    if [[ "$status" == "ok" && "$version" == "$IMAGE_TAG" ]]; then
+      echo "  ${GREEN}✓ laeuft auf ${IMAGE_TAG}${RESET}"
+      return 0
+    fi
+    if (( $(date +%s) >= deadline )); then
+      echo "  ${RED}✗ Timeout — zuletzt status=${status:-?} version=${version:-?}${RESET}"
+      echo "  ${YELLOW}Pruefen:${RESET} Coolify → Ressource → Deployment-Logs"
+      return 1
+    fi
+    printf '.'; sleep 10
+  done
+}
+
+for t in "${TARGETS[@]}"; do
+  # shellcheck disable=SC2086
+  deploy_one $t || {
+    echo ""
+    echo "${RED}${BOLD}Abbruch.${RESET} Weitere Ressourcen wurden nicht angefasst."
+    echo "${YELLOW}Rollback:${RESET} bit-deploy <name> <vorheriger-tag>"
+    exit 1
+  }
+done
+
+echo ""
+echo "${GREEN}${BOLD}✓ Fertig: ${#TARGETS[@]} Ressource(n) auf ${IMAGE_TAG}${RESET}"

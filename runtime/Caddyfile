@@ -1,0 +1,42 @@
+{
+	admin off
+	auto_https off
+}
+
+# TLS macht Traefik (Coolify-Proxy) davor, der Container spricht nur HTTP.
+:80 {
+	# Healthcheck vor der Auth, damit Coolify ihn auch im Staging erreicht.
+	# Meldet die laufende Version (IMAGE_TAG kommt aus der Compose-Ressource),
+	# damit bit-deploy erkennt, ob wirklich der neue Build laeuft.
+	handle /healthz {
+		header Content-Type application/json
+		header Cache-Control no-store
+		respond `\{"status":"ok","version":"{$IMAGE_TAG:unbekannt}"\}` 200
+	}
+
+	handle {
+		import /etc/caddy/mode-{$SITE_MODE}.caddy
+
+		header {
+			X-Content-Type-Options "nosniff"
+			X-Frame-Options "SAMEORIGIN"
+			Referrer-Policy "strict-origin-when-cross-origin"
+			-Server
+		}
+
+		# Gehashte Assets duerfen lange gecacht werden, alles andere nicht.
+		@assets path /assets/*
+		header @assets Cache-Control "public, max-age=31536000, immutable"
+
+		root * /srv
+		# SPA-Fallback: /leistungen & Co. kennt nur der React-Router.
+		try_files {path} /index.html
+		file_server
+	}
+
+	encode zstd gzip
+	log {
+		output stdout
+		format console
+	}
+}

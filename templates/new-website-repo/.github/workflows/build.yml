@@ -1,0 +1,15 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  website:
+    uses: BIT-Collective/website-runtime/.github/workflows/build-website.yml@v1.0.0
+    permissions:
+      contents: read
+      packages: write

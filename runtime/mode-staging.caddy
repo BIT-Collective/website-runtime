@@ -1,0 +1,6 @@
+# Staging (Ring 0): nicht oeffentlich, nicht indexierbar.
+# BASIC_AUTH_HASH per `caddy hash-password` erzeugen und in Coolify als Env setzen.
+header X-Robots-Tag "noindex, nofollow"
+basic_auth {
+	{$BASIC_AUTH_USER:bit} {$BASIC_AUTH_HASH}
+}

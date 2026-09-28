@@ -1,0 +1,20 @@
+# Baut das Basis-Image website-runtime selbst — gleicher Ablauf wie jede Website
+# (sha-Build bei push, Release-Tag per Retag), nur mit runtime/ als Kontext.
+name: runtime
+
+on:
+  push:
+    branches: [main]
+    paths: ["runtime/**", ".github/workflows/runtime.yml", ".github/workflows/build-website.yml"]
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  runtime:
+    uses: ./.github/workflows/build-website.yml
+    with:
+      context: runtime
+      dockerfile: runtime/Dockerfile
+      # Das Basis-Image hat keine Startseite, nur den Healthcheck.
+      smoke-path: /healthz
