@@ -35,8 +35,15 @@
 	}
 
 	encode zstd gzip
+	# Zugriffslog mit voller IP, max. 7 Tage (so steht es in den Datenschutzerklaerungen):
+	# taeglich neue Datei, rotierte Dateien nach 6 Tagen geloescht. Liegt nur im Container,
+	# ein Redeploy loescht es zusaetzlich.
 	log {
-		output stdout
-		format console
+		output file /var/log/caddy/access.log {
+			roll_interval 24h
+			roll_keep_for 144h
+			roll_keep 7
+		}
+		format json
 	}
 }
